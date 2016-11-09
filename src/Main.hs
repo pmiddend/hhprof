@@ -11,9 +11,10 @@ import Data.Function(($))
 import Data.Monoid((<>))
 import qualified Data.ByteString as BS
 import Data.Word(Word8,Word16,Word32,Word64)
-import Data.Attoparsec.ByteString(Parser,takeWhile,take,parseOnly,anyWord8,many')
+import Data.Attoparsec.ByteString(Parser,takeWhile,count,take,parseOnly,anyWord8,many')
 import Data.Attoparsec.Binary(anyWord32be,anyWord64be)
 import Control.Monad(return)
+import Control.Applicative((<*>))
 import Data.Functor((<$>))
 import Data.Bits((.|.),shift)
 import Text.Show(Show,show)
@@ -44,12 +45,15 @@ tagParser idLength idParser = do
       thisId <- idParser
       rest <- take (fromIntegral (length - idLength))
       return (TagUtf8String thisId rest)
-    0x02 -> do
-      serialNumber <- anyWord32be
-      objectId <- idParser
+    0x02 -> TagLoadClass <$> anyWord32be <*> idParser <*> anyWord32be <*> idParser
+    0x03 -> TagUnloadClass <$> anyWord32be
+    0x04 -> TagStackFrame <$> idParser <*> idParser <*> idParser <*> idParser <*> anyWord32be <*> anyWord32be
+    0x05 -> do
       stackTraceSerialNumber <- anyWord32be
-      classNameString <- idParser
-      return (TagLoadClass serialNumber objectId stackTraceSerialNumber classNameString)
+      threadSerialNumber <- anyWord32be
+      numberOfFrames <- anyWord32be
+      frameIds <- count (fromIntegral numberOfFrames) idParser
+      return $ TagStackTrace stackTraceSerialNumber threadSerialNumber numberOfFrames frameIds
     _ -> do
       _ <- take (fromIntegral length)
       return TagDummy
