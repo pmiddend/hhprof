@@ -1,6 +1,6 @@
 module Main where
 
-import Prelude(fromIntegral,(-),undefined)
+import Prelude(fromIntegral,(-),undefined,error)
 import Data.List(intercalate)
 import Data.String(String)
 import Data.Either(Either(..))
@@ -11,9 +11,9 @@ import Data.Function(($))
 import Data.Monoid((<>))
 import qualified Data.ByteString as BS
 import Data.Word(Word8,Word16,Word32,Word64)
-import Data.Attoparsec.ByteString(Parser,takeWhile,count,take,parseOnly,anyWord8,many')
+import Data.Attoparsec.ByteString(Parser,takeWhile,manyTill,word8,count,take,parseOnly,anyWord8,many')
 import Data.Attoparsec.Binary(anyWord32be,anyWord64be,anyWord16be)
-import Control.Monad(return)
+import Control.Monad(return,(>>=))
 import Control.Applicative((<*>))
 import Data.Functor((<$>))
 import Data.Bits((.|.),shift)
@@ -71,14 +71,7 @@ tagParser idLength idParser = do
       sites <- count (fromIntegral siteCount) siteParser
       return $ TagAllocSites bitMaskFlags cutoffRatio liveBytes liveInstances bytesAllocated instancesAllocated siteCount sites
     0x07 -> TagHeapSummary <$> anyWord32be <*> anyWord32be <*> anyWord64be <*> anyWord64be
-    0x0A -> do
-      threadSerialNumber <- anyWord32be
-      threadObjectId <- idParser
-      traceSerialNumber <- anyWord32be
-      threadNameStringId <- idParser
-      threadGroupNameId <- idParser
-      parentGroupNameId <- idParser
-      return $ TagStartThread threadSerialNumber threadObjectId traceSerialNumber threadNameStringId threadGroupNameId parentGroupNameId
+    0x0A -> TagStartThread <$> anyWord32be <*> idParser <*> anyWord32be <*> idParser<*> idParser<*> idParser
     0x0B -> TagEndThread <$> anyWord32be
     0x2C -> return TagHeapDumpEnd
     0x0D -> do
@@ -87,14 +80,84 @@ tagParser idLength idParser = do
       traces <- count (fromIntegral tracesCount) traceParser
       return $ TagCpuSamples numberSamples tracesCount traces
     0x0E -> TagControlSettings <$> anyWord32be <*> anyWord16be
-    0x0C -> parseHeapDump idParser
+    0x0C -> do
+      hd <- parseSubTag idParser
+      return $ TagHeapDump [hd]
     0x1C -> parseHeapDump idParser
     _ -> do
       _ <- take (fromIntegral length)
       return TagDummy
 
 parseHeapDump :: Parser a -> Parser (Tag a)
-parseHeapDump = undefined
+parseHeapDump idParser = TagHeapDump <$> manyTill (parseSubTag idParser) (word8 0x2C)
+
+parseSubTag :: Parser a -> Parser (SubTag a)
+parseSubTag idParser = do
+  tagType <- anyWord8
+  case tagType of
+    0xFF -> SubTagRootUnknown <$> idParser
+    0x01 -> SubTagRootJniGlobal <$> idParser <*> idParser
+    0x02 -> SubTagRootJniLocal <$> idParser <*> anyWord32be <*> anyWord32be
+    0x03 -> SubTagRootJavaFrame <$> idParser <*> anyWord32be <*> anyWord32be
+    0x04 -> SubTagRootNativeStack <$> idParser <*> anyWord32be
+    0x05 -> SubTagRootStickyClass <$> idParser
+    0x06 -> SubTagRootThreadBlock <$> idParser <*> anyWord32be
+    0x07 -> SubTagRootMonitorUsed <$> idParser
+    0x08 -> SubTagRootThreadObject <$> idParser <*> anyWord32be <*> anyWord32be
+    0x20 -> do
+      a0 <- idParser
+      a1 <- anyWord32be
+      a2 <- idParser
+      a3 <- idParser
+      a4 <- idParser
+      a5 <- idParser
+      a6 <- idParser
+      a7 <- idParser
+      a8 <- anyWord32be
+      constantPoolCount <- anyWord16be
+      constantPool <- count (fromIntegral constantPoolCount) (constantPoolParser idParser)
+      staticFieldCount <- anyWord16be
+      staticFields <- count (fromIntegral staticFieldCount) (staticFieldParser idParser)
+      instanceFieldCount <- anyWord16be
+      instanceFields <- count (fromIntegral instanceFieldCount) (instanceFieldParser idParser)
+      return $ SubTagClassDump a0 a1 a2 a3 a4 a5 a6 a7 a8 constantPool staticFields instanceFields
+    0x21 -> do
+      a0 <- idParser
+      a1 <- anyWord32be
+      a2 <- idParser
+      byteCount <- anyWord32be
+      bytes <- take (fromIntegral byteCount)
+      return $ SubTagInstanceDump a0 a1 a2 byteCount bytes
+    0x22 -> do
+      arrayObjectId <- idParser
+      stackTraceSerialNumber <- anyWord32be
+      numberOfElements <- anyWord32be
+      arrayClassObjectId <- idParser
+      elements <- count (fromIntegral numberOfElements) idParser
+      return $ SubTagObjectArrayDump arrayObjectId stackTraceSerialNumber numberOfElements arrayClassObjectId elements
+    0x23 -> do
+      arrayObjectId <- idParser
+      stackTraceSerialNumber <- anyWord32be
+      numberOfElements <- anyWord32be
+      elementType <- anyWord8
+      elements <- take (fromIntegral numberOfElements)
+      return $ SubTagPrimitiveArrayDump arrayObjectId stackTraceSerialNumber numberOfElements elementType elements
+    _ -> return SubTagDummy
+
+constantPoolParser :: Parser a -> Parser (ConstantPoolRecord a)
+constantPoolParser idParser = do
+  index <- anyWord16be
+  entryType <- anyWord8
+  ConstantPoolRecord index <$> recordFieldParser idParser entryType
+
+instanceFieldParser :: Parser a -> Parser (InstanceField a)
+instanceFieldParser idParser = InstanceField <$> idParser <*> anyWord8
+
+staticFieldParser :: Parser a -> Parser (StaticField a)
+staticFieldParser idParser = do
+  id <- idParser
+  fieldType <- anyWord8
+  StaticField id <$> recordFieldParser idParser fieldType
 
 data Tag a = TagUtf8String a BS.ByteString
            | TagLoadClass Word32 a Word32 a
@@ -120,19 +183,44 @@ data SubTag a = SubTagRootUnknown a
               | SubTagRootThreadBlock a Word32
               | SubTagRootMonitorUsed a
               | SubTagRootThreadObject a Word32 Word32
-              | SubTagClassDump a Word32 a a a a a a Word32 [ConstantPoolRecord] [StaticField] [InstanceField]
-              | SubTagInstanceDump a Word32 a Word32 [Word8]
+              | SubTagClassDump a Word32 a a a a a a Word32 [ConstantPoolRecord a] [StaticField a] [InstanceField a]
+              | SubTagInstanceDump a Word32 a Word32 BS.ByteString
               | SubTagObjectArrayDump a Word32 Word32 a [a]
-              | SubTagPrimitiveArrayDump a Word32 Word32 Word8 [Word8] deriving(Show)
+              | SubTagPrimitiveArrayDump a Word32 Word32 Word8 BS.ByteString
+              | SubTagDummy
+              deriving(Show)
 
-data ConstantPoolRecord = ConstantPoolRecord8 Word8
-                        | ConstantPoolRecord16 Word16
-                        | ConstantPoolRecord32 Word32
-                        | ConstantPoolRecord64 Word64 deriving(Show)
+data ConstantPoolRecord a = ConstantPoolRecord {
+  index :: Word16,
+  field :: RecordField a
+  } deriving(Show)
 
-data StaticField = StaticField8 Word8 | StaticField16 Word16 | StaticField32 Word32 | StaticField64 Word64 deriving(Show)
+data RecordField a =
+    RecordField8 Word8
+  | RecordField16 Word16
+  | RecordField32 Word32
+  | RecordField64 Word64
+  | RecordFieldId a
+  deriving(Show)
 
-data InstanceField = InstanceField8 Word8 | InstanceField16 Word16 | InstanceField32 Word32 | InstanceField64 Word64 deriving(Show)
+recordFieldParser :: Parser a -> Word8 -> Parser (RecordField a)
+recordFieldParser idParser fieldType =
+  case fieldType of
+    2 -> RecordFieldId <$> idParser
+    4 -> RecordField8 <$> anyWord8 -- boolean, 8 bit is speculative!
+    5 -> RecordField16 <$> anyWord16be -- char, should be 16 bit
+    6 -> RecordField32 <$> anyWord32be -- float
+    7 -> RecordField64 <$> anyWord64be -- double
+    8 -> RecordField8 <$> anyWord8 -- byte
+    9 -> RecordField16 <$> anyWord16be -- short
+    10 -> RecordField32 <$> anyWord32be -- int
+    11 -> RecordField64 <$> anyWord64be -- long
+    x -> error $ "invalid record field type " <> show x
+                                                  
+
+data StaticField a = StaticField { staticFieldId :: a, staticField :: RecordField a } deriving(Show)
+
+data InstanceField a = InstanceField { instanceFieldId :: a, instanceFieldType :: Word8 } deriving(Show)
 
 data Trace = Trace Word32 Word32 deriving(Show)
 
